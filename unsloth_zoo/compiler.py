@@ -50,13 +50,19 @@ from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
+from .temporary_patches.common import get_torch_compile_options
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
@@ -97,6 +103,10 @@ DISABLED_KEYWORDS = [
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
     "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
+    "segment_sum", # falcon h1
+    "apply_mask_to_padding_states", # falcon h1
+    "reshape_into_chunks", # falcon h1
+    "pad_tensor_by_size", # falcon h1
 ]
 
 _license_header = """
@@ -137,9 +147,14 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
-import torch._dynamo.eval_frame as torch_dynamo_eval_frame
-torch_compiler_set_stance = torch.compiler.set_stance
-
+try:
+    import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+    torch_dynamo_eval_frame._stance.stance
+    torch_compiler_set_stance = torch.compiler.set_stance
+except:
+    torch_dynamo_eval_frame = None
+    torch_compiler_set_stance = None
+pass
 """
 
 _disabled_sdpa_code = f"""{_license_header}
@@ -669,19 +684,22 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    old_stance = torch_dynamo_eval_frame._stance.stance
-    if INFERENCE_RUNS == 32:
-        # Skip guards and fail on recompiles after 32 token inferences
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = True)
+    if torch_dynamo_eval_frame is not None:
+        old_stance = torch_dynamo_eval_frame._stance.stance
+    else:
+        old_stance = None
+    if old_stance is not None and INFERENCE_RUNS == 1:
+        # Skip guards and return to eager -> we still need guards!
+        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
             logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 32 inference runs. "\\
+                f"Unsloth: Removing compiler guards after 1 inference run. "\\
                 f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
                 f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
             )
     elif old_stance == "eager_on_recompile":
         pass
-    elif old_stance == "default" and INFERENCE_RUNS > 32:
+    elif old_stance == "default" and INFERENCE_RUNS > 1:
         # Reset compiler stance
         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
@@ -1783,8 +1801,7 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
     pass
 pass
 
-
-def compile_causal_conv1d():
+def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING=False):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
@@ -1793,8 +1810,42 @@ def compile_causal_conv1d():
             torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
         causal_conv1d.causal_conv1d_update = \
             torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling causal_conv1d")
+        return True
+    except Exception as e:
+        print(e, str(e))
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling causal_conv1d")
+        return False
+pass
+
+def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import mamba_ssm
+        mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
+                recursive = True
+            )
+        mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
+            torch.compiler.disable(
+            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+            recursive = True
+            )
+        mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.selective_state_update.selective_state_update,
+                recursive = True
+            )
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling mamba_ssm")
         return True
     except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling mamba_ssm")
         return False
 pass
 
@@ -1872,33 +1923,27 @@ def unsloth_compile_transformers(
     UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
     UNSLOTH_ENABLE_LOGGING        = os.environ.get("UNSLOTH_ENABLE_LOGGING",        "0") == "1"
-    torch_compile_options = {
-        "epilogue_fusion"           : epilogue_fusion,
-        "max_autotune"              : max_autotune,
-        "shape_padding"             : shape_padding,
-        "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
-        "triton.cudagraphs"         : cudagraphs,
-        "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
-        "dce"                       : True,
-        "memory_planning"           : True,
-        "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
-        "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
-        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
-        "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
-        "group_fusion"              : True,
-        "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
-        "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
-        "triton.multi_kernel"       : False, # Sometimes fails
-        "triton.use_block_ptr"      : False,
-        "triton.enable_persistent_tma_matmul" : True,
-        "triton.autotune_at_compile_time"     : True,
-    }
+    torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = epilogue_fusion,
+        max_autotune = max_autotune,
+        shape_padding = shape_padding,
+        debug = UNSLOTH_COMPILE_DEBUG,
+        cudagraphs = cudagraphs,
+        coordinate_descent_tuning = UNSLOTH_COMPILE_MAXIMUM,
+        logging = UNSLOTH_ENABLE_LOGGING,
+        combo_kernels = False, # Causes incompatible gradient sizes on 2.6
+        group_fusion = True,
+        memory_planning = True,
+        multi_kernel = False, # Sometimes fails
+        use_block_ptr = False, # Sometimes fails
+    )
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Disable compiling mamba type models
-    has_causal_conv1d = compile_causal_conv1d()
+    has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
+    has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -1937,6 +1982,17 @@ def unsloth_compile_transformers(
         print(
             "**********\n"\
             "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
+    # If mamba type, but no fast causal functions, warn!
+    if not has_mamba_ssm and \
+        ("mamba_chunk_scan_combined" in full_source or "mamba_split_conv1d_scan_combined" in full_source or "selective_state_update" in full_source):
+        print(
+            "**********\n"\
+            "Unsloth: Please install `mamba_ssm` to speed up Mamba training via `pip install mamba_ssm`\n"\
             "If you don't, training will still work, just might be slower for Mamba type models.\n"\
             "**********\n"
         )
