@@ -21,7 +21,14 @@ from packaging.version import Version
 import os
 import warnings
 from .utils import _get_dtype
-from . import DEVICE_TYPE
+from .device_type import (
+    is_hip,
+    get_device_type,
+    DEVICE_TYPE,
+    DEVICE_TYPE_TORCH,
+    DEVICE_COUNT,
+    ALLOW_PREQUANTIZED_MODELS,
+)
 
 __all__ = [
     "calculate_n_gradient_checkpoints",
@@ -296,7 +303,7 @@ global LAST_GC_INDEX
 global FIRST_PASS
 global CURRENT_GC_INDEX
 
-if DEVICE_TYPE == "cuda":
+if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
 elif DEVICE_TYPE == "xpu":
     torch_gpu_stream = torch.xpu.stream
@@ -324,6 +331,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         if DEVICE_TYPE == "cuda":
             major_version, minor_version = torch.cuda.get_device_capability()
             SUPPORTS_BFLOAT16 = (major_version >= 8)
+        elif DEVICE_TYPE == "hip":
+            SUPPORTS_BFLOAT16 = True
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
@@ -335,12 +344,12 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     pass
 
     # Allocate buffers to how many GPUs
-    n_gpus = torch.cuda.device_count() if DEVICE_TYPE == "cuda" else torch.xpu.device_count()
-    GPU_BUFFERS = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE}:{i}") for i in range(n_gpus)])
+    n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    GPU_BUFFERS = tuple([torch.empty(2*256*2048, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
-    if DEVICE_TYPE == "cuda":
+    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
+    if DEVICE_TYPE in ("cuda", "hip"):
         MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])

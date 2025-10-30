@@ -26,6 +26,7 @@ from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype
+from .hf_utils import dtype_from_config
 import os
 import re
 
@@ -96,6 +97,7 @@ def prepare_model_for_training(
     train_embedding            : Optional[bool] = False,
     train_lm_head              : Optional[bool] = False,
     float32_mixed_precision    : Optional[bool] = True,
+    patch_modules_to_save      : Optional[bool] = False,
 ) -> Any:
     # All Unsloth Zoo code licensed under LGPLv3
     assert(use_gradient_checkpointing in (True, False, "unsloth",))
@@ -106,7 +108,7 @@ def prepare_model_for_training(
     assert(type(train_lm_head) is bool)
     assert(type(float32_mixed_precision) is bool)
 
-    dtype = _get_dtype(model.config.torch_dtype)
+    dtype = _get_dtype(dtype_from_config(model.config))
     mixed_precision_dtype = torch.float32
     if dtype == torch.float16:
         # We need to upcast to float32
@@ -205,6 +207,33 @@ def prepare_model_for_training(
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    pass
+
+    # Upcast modules_to_save
+    if patch_modules_to_save:
+        try:
+            from peft.utils import ModulesToSaveWrapper
+        except:
+            ModulesToSaveWrapper = None
+
+        for name, module in model.named_modules():
+            if type(module) is ModulesToSaveWrapper or "ModulesToSave" in name:
+                if getattr(module, "original_module", None) is not None:
+                    module.original_module.requires_grad_(False)
+                if getattr(module, "modules_to_save", None) is not None:
+                    for saved_module in module.modules_to_save.modules():
+                        if hasattr(saved_module, "weight"):
+                            if saved_module.weight.dtype == torch.float16:
+                                print(f"Unsloth: Upcasting `{name}` from float16 to float32 since it's in `modules_to_save`. Also allowing gradients.")
+                                saved_module.to(torch.float32)
+                                saved_module.requires_grad_(True)
+                            else:
+                                print(f"Unsloth: Allowing gradients for `{name}` since it's in `modules_to_save`.")
+                                saved_module.requires_grad_(True)
+                    pass
+                pass
+            pass
+        pass
     pass
 
     return model
@@ -341,7 +370,8 @@ def unsloth_train(trainer):
 
     # Mixed precision scaling
     torch_version = torch.__version__
-    if model.config.torch_dtype == torch.float16:
+    config_dtype = dtype_from_config(model.config)
+    if config_dtype == torch.float16:
         mixed_precision = "fp16"
         mixed_dtype = torch.float16
         # torch.cuda.amp.autocast is deprecated >= 2.4

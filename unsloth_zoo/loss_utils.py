@@ -53,8 +53,18 @@ if DEVICE_TYPE == "cuda":
     else:
         HAS_CUT_CROSS_ENTROPY = False
     pass
+elif DEVICE_TYPE == "hip":
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "xpu":
-    HAS_CUT_CROSS_ENTROPY = False
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
 else:
     pass
 pass
@@ -66,9 +76,10 @@ __all__ = [
     "fused_linear_cross_entropy",
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
-    "unsloth_compiled_fused_ce_loss_function",
-    "unsloth_compiled_ce_loss_function",
+    "unsloth_fused_ce_loss",
 ]
+
+from .fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -159,7 +170,7 @@ def post_patch_loss_function(model):
 pass
 
 
-torch_cuda_device = torch.cuda.device
+current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -177,7 +188,7 @@ def fused_linear_cross_entropy(
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
-    with torch_cuda_device(lm_weight.device):
+    with current_device(lm_weight.device):
         loss = linear_cross_entropy(
             hidden_states.to(lm_weight.dtype if lm_weight.dtype in (torch.float16, torch.bfloat16) else hidden_states.dtype),
             lm_weight,
@@ -239,6 +250,19 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
+
+# Check for DataParallel
+#
+# DataParallel uses scatter and gather
+# cpu->0 scatter 0 --> 0 gather 0
+# cpu->0 scatter 1 --> 1 gather 0
+# cpu->0 scatter 2 --> 2 gather 0
+#
+# DistributedDataParallel is faster and launches multiple processes
+# cpu->0 ------------> 0 gather 0
+# cpu->1 ------------> 1 gather 0
+# cpu->2 ------------> 2 gather 0
+from transformers.training_args import ParallelMode
 
 # Cannot use sadly
 # import torch._dynamo.eval_frame as torch_dynamo_eval_frame
@@ -326,8 +350,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-            if device is not None and torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
+            if torch.is_tensor(num_items_in_batch):
+                if device is not None:
+                    num_items_in_batch = num_items_in_batch.to(device)
+                if getattr(self.args, "n_gpu", 1) > 1 and self.args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
+                    # Uses DataParallel scatter gather
+                    # So we have to scatter num_items_in_batch to each GPU
+                    num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
@@ -352,314 +381,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     return batch_samples, num_items_in_batch
 pass
 
-
-@functools.cache
-def _get_chunk_size(vocab_size : int, requires_grad_ : bool):
-    n_chunks = int(math.ceil((vocab_size / 262144) * 8))
-    if requires_grad_: n_chunks += 2
-    return n_chunks
-pass
-
-
-def _unsloth_compiled_unchunked_ce_loss_function(
-    output_logits : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    vocab_size : int = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    n_chunks : int = 0,
-):
-    device = output_logits.device
-    if logit_scale_multiply != 0:
-        output_logits = output_logits * logit_scale_multiply
-    if logit_scale_divide != 0:
-        output_logits = output_logits / logit_scale_divide
-    if logit_softcapping != 0:
-        output_logits = output_logits / logit_softcapping
-        output_logits = torch.tanh(output_logits)
-        output_logits = output_logits * logit_softcapping
-
-    shift_logits = output_logits
-    shift_labels = torch.empty_like(output_labels, device = device)
-    shift_labels[..., :-1] = output_labels[..., 1:]
-    if mask is not None:
-        mask = mask.to(device = device)
-        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-    pass
-    shift_labels[..., -1] = -100
-    # shift_logits = output_logits[..., :-1, :].float().contiguous()
-    # shift_labels = output_labels[..., 1:].contiguous()
-
-    torch._check_is_size(vocab_size)
-    shift_logits = shift_logits.view(-1, vocab_size)
-    shift_labels = shift_labels.view(-1)
-    loss = torch.nn.functional.cross_entropy(
-        input  = shift_logits.float().contiguous(),
-        target = shift_labels.contiguous(),
-        reduction = 'sum',
-    )
-    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
-    loss = loss / torch.tensor(divisor, dtype = torch.float32)
-    return loss
-pass
-_unsloth_compiled_unchunked_ce_loss_function = torch.compile(
-    _unsloth_compiled_unchunked_ce_loss_function,
-    fullgraph = True,
-    dynamic = True,
-    options = torch_compile_options,
-)
-
-def _unsloth_compiled_ce_loss_function(
-    output_logits : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    vocab_size : int = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    n_chunks : int = 8,
-):
-    device = output_logits.device
-    if logit_scale_multiply != 0:
-        output_logits = output_logits * logit_scale_multiply
-    if logit_scale_divide != 0:
-        output_logits = output_logits / logit_scale_divide
-    if logit_softcapping != 0:
-        output_logits = output_logits / logit_softcapping
-        output_logits = torch.tanh(output_logits)
-        output_logits = output_logits * logit_softcapping
-
-    shift_logits = output_logits
-    shift_labels = torch.empty_like(output_labels, device = device)
-    shift_labels[..., :-1] = output_labels[..., 1:]
-    if mask is not None:
-        mask = mask.to(device = device)
-        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-    pass
-    shift_labels[..., -1] = -100
-    # shift_logits = output_logits[..., :-1, :].float().contiguous()
-    # shift_labels = output_labels[..., 1:].contiguous()
-
-    torch._check_is_size(vocab_size)
-    shift_logits = shift_logits.view(-1, vocab_size)
-    shift_labels = shift_labels.view(-1)
-    torch._check_is_size(n_chunks)
-    __shift_logits = torch.chunk(shift_logits, n_chunks, dim = 0)
-    __shift_labels = torch.chunk(shift_labels, n_chunks, dim = 0)
-    loss = 0.0
-    for (_shift_logits, _shift_labels) in zip(__shift_logits, __shift_labels):
-        loss += torch.nn.functional.cross_entropy(
-            input  = _shift_logits.float().contiguous(),
-            target = _shift_labels.contiguous(),
-            reduction = 'sum',
-        )
-    pass
-    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
-    loss = loss / torch.tensor(divisor, dtype = torch.float32)
-    return loss
-pass
-_unsloth_compiled_ce_loss_function = torch.compile(
-    _unsloth_compiled_ce_loss_function,
-    fullgraph = True,
-    dynamic = True,
-    options = torch_compile_options,
-)
-
-def unsloth_compiled_ce_loss_function(
-    output_logits : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    vocab_size : int = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    requires_grad_ : bool = False,
-):
-    bsz, qlen, hd = output_logits.shape
-    ce_loss_function = \
-        _unsloth_compiled_ce_loss_function \
-        if bsz*qlen >= 512 else \
-        _unsloth_compiled_unchunked_ce_loss_function
-    return ce_loss_function(
-        output_logits = output_logits,
-        output_labels = output_labels,
-        logit_scale_multiply = logit_scale_multiply,
-        logit_scale_divide = logit_scale_divide,
-        logit_softcapping = logit_softcapping,
-        vocab_size = vocab_size,
-        n_items = n_items,
-        mask = mask,
-        n_chunks = _get_chunk_size(vocab_size, requires_grad_),
-    )
-pass
-
-
-def _unsloth_compiled_fused_ce_loss_function(
-    hidden_states : torch.Tensor,
-    lm_head_weight : torch.Tensor,
-    lm_head_bias : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    n_chunks : int = 8,
-):
-    device = lm_head_weight.device
-
-    # Get shifted labels first
-    shift_labels = torch.empty_like(output_labels, device = device)
-    shift_labels[..., :-1] = output_labels[..., 1:]
-    if mask is not None:
-        mask = mask.to(device = device)
-        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-    pass
-    shift_labels[..., -1] = -100
-    shift_labels = shift_labels.view(-1)
-
-    # Chunk hidden_states and labels
-    bsz, qlen, hd = hidden_states.shape
-    hidden_states = hidden_states.view(-1, hd)
-    torch._check_is_size(n_chunks)
-    __shift_states = torch.chunk(hidden_states, n_chunks, dim = 0)
-    __shift_labels = torch.chunk(shift_labels,  n_chunks, dim = 0)
-    loss = 0.0
-
-    # Chunk hidden states and logits
-    for (_shift_states, _shift_labels) in zip(__shift_states, __shift_labels):
-
-        _shift_logits = torch.nn.functional.linear(
-            _shift_states.to(lm_head_weight.device),
-            lm_head_weight,
-            lm_head_bias,
-        )
-
-        # Apply softcapping and other functions
-        if logit_scale_multiply != 0:
-            _shift_logits = _shift_logits * logit_scale_multiply
-        if logit_scale_divide != 0:
-            _shift_logits = _shift_logits / logit_scale_divide
-        if logit_softcapping != 0:
-            _shift_logits = _shift_logits / logit_softcapping
-            _shift_logits = torch.tanh(_shift_logits)
-            _shift_logits = _shift_logits * logit_softcapping
-
-        loss += torch.nn.functional.cross_entropy(
-            input  = _shift_logits.float().contiguous(),
-            target = _shift_labels.contiguous(),
-            reduction = 'sum',
-        )
-    pass
-    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
-    loss = loss / torch.tensor(divisor, dtype = torch.float32)
-    return loss
-pass
-_unsloth_compiled_fused_ce_loss_function = torch.compile(
-    _unsloth_compiled_fused_ce_loss_function,
-    fullgraph = True,
-    dynamic = None,
-    options = {"trace.enabled" : True,},
-)
-
-def _unsloth_compiled_unchunked_fused_ce_loss_function(
-    hidden_states : torch.Tensor,
-    lm_head_weight : torch.Tensor,
-    lm_head_bias : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    n_chunks : int = 8,
-):
-    device = lm_head_weight.device
-
-    # Get shifted labels first
-    shift_labels = torch.empty_like(output_labels, device = device)
-    shift_labels[..., :-1] = output_labels[..., 1:]
-    if mask is not None:
-        mask = mask.to(device = device)
-        shift_labels[..., :-1][mask[..., 1:] == 0] = -100
-    pass
-    shift_labels[..., -1] = -100
-    shift_labels = shift_labels.view(-1)
-
-    # Chunk hidden_states and labels
-    bsz, qlen, hd = hidden_states.shape
-    hidden_states = hidden_states.view(-1, hd)
-
-    shift_logits = torch.nn.functional.linear(
-        hidden_states.to(lm_head_weight.device),
-        lm_head_weight,
-        lm_head_bias,
-    )
-
-    # Apply softcapping and other functions
-    if logit_scale_multiply != 0:
-        shift_logits = shift_logits * logit_scale_multiply
-    if logit_scale_divide != 0:
-        shift_logits = shift_logits / logit_scale_divide
-    if logit_softcapping != 0:
-        shift_logits = shift_logits / logit_softcapping
-        shift_logits = torch.tanh(shift_logits)
-        shift_logits = shift_logits * logit_softcapping
-
-    loss = torch.nn.functional.cross_entropy(
-        input  = shift_logits.float().contiguous(),
-        target = shift_labels.contiguous(),
-        reduction = 'sum',
-    )
-    divisor = n_items if n_items is not None else (shift_labels != -100).sum()
-    loss = loss / torch.tensor(divisor, dtype = torch.float32)
-    return loss
-pass
-_unsloth_compiled_unchunked_fused_ce_loss_function = torch.compile(
-    _unsloth_compiled_unchunked_fused_ce_loss_function,
-    fullgraph = True,
-    dynamic = True,
-    options = torch_compile_options,
-)
-
-def unsloth_compiled_fused_ce_loss_function(
-    hidden_states : torch.Tensor,
-    lm_head_weight : torch.Tensor,
-    lm_head_bias : torch.Tensor,
-    output_labels : torch.Tensor,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide : float = 0,
-    logit_softcapping : float = 0,
-    vocab_size : int = 0,
-    n_items : Optional[int] = 0,
-    mask : torch.Tensor = None,
-    requires_grad_ : bool = False,
-):
-    # Decide on chunk size
-    bsz, qlen, hd = hidden_states.shape
-    ce_loss_function = \
-        _unsloth_compiled_fused_ce_loss_function \
-        if bsz*qlen >= 512 else \
-        _unsloth_compiled_unchunked_fused_ce_loss_function
-    return ce_loss_function(
-        hidden_states = hidden_states,
-        lm_head_weight = lm_head_weight,
-        lm_head_bias = lm_head_bias,
-        output_labels = output_labels,
-        logit_scale_multiply = logit_scale_multiply,
-        logit_scale_divide = logit_scale_divide,
-        logit_softcapping = logit_softcapping,
-        n_items = n_items,
-        mask = mask,
-        n_chunks = _get_chunk_size(vocab_size, requires_grad_),
-    )
-pass
-    
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

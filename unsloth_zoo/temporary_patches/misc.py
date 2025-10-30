@@ -17,8 +17,9 @@
 import torch
 import torch.nn as nn
 import inspect
+import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile_options
+from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
     process_output_options,
@@ -36,6 +37,7 @@ from .utils import (
 )
 from textwrap import dedent
 import re
+import os
 
 def patch_merge_quantization_configs():
     # Fixes some issues with merging quantization configs
@@ -177,7 +179,11 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        return old_forward(**locals())
+        new_kwargs = locals().copy()
+        new_kwargs.pop('old_forward', None)
+        kwargs = new_kwargs.pop('kwargs', dict())
+        new_kwargs.update(kwargs)
+        return old_forward(**new_kwargs)
     patch_function(transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -328,7 +334,11 @@ def patch_CsmForConditionalGeneration_forward():
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: KWARGS_TYPE,
     ) -> Union[Tuple, CsmOutputWithPast]:
-        return old_forward(**locals())
+        new_kwargs = locals().copy()
+        new_kwargs.pop('old_forward', None)
+        kwargs = new_kwargs.pop('kwargs', dict())
+        new_kwargs.update(kwargs)
+        return old_forward(**new_kwargs)
     patch_function(transformers.models.csm.modeling_csm.CsmForConditionalGeneration, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
@@ -617,3 +627,170 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
+
+
+def fix_mamba_ssm_float32():
+    try:
+        import mamba_ssm.ops.triton.ssd_chunk_scan
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Try getting file for mamba_ssm
+    try:
+        ssd_chunk_scan_file = inspect.getfile(mamba_ssm.ops.triton.ssd_chunk_scan)
+        with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+
+    # Find dst +=|= tl.dot(a, b)
+    matches = list(re.finditer(
+        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
+        file)
+    )
+    for match in matches:
+        old = match.group(0)
+        dst, adder, a, b = match.groups()
+        accumulator = '' if adder == "=" else f', acc = {dst}'
+        # Change to float32 if float16 seen otherwise leave as original precision
+        new = f" {dst} = tl.dot("\
+            f"{a}.to(tl.float32), "\
+            f"{b}.to(tl.float32)"\
+            f"{accumulator})"
+        file = file.replace(old, new)
+    pass
+
+    try:
+        # Reload module since we editted it
+        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
+        importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+    except Exception as e:
+        return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+pass
+TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
+
+
+# Mllama Patches
+
+def patch_MllamaVisionEncoderLayer():
+    try:
+        import math
+        import inspect
+        import transformers.models.mllama.modeling_mllama
+        from transformers.models.mllama.modeling_mllama import (
+            MllamaVisionConfig,
+            MllamaVisionAttention,
+            MllamaVisionMLP,
+            MllamaVisionEncoder,
+        )
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception as e:
+        return raise_error("transformers.models.mllama.modeling_mllama", e)
+
+
+    # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/models/mllama/modeling_mllama.py#L275C1-L315C28
+    class MllamaVisionEncoderLayer(GradientCheckpointingLayer):
+        def __init__(self, config: MllamaVisionConfig, is_gated: bool = False):
+            super().__init__()
+
+            self.hidden_size = config.hidden_size
+            self.num_attention_heads = config.attention_heads
+            self.is_gated = is_gated
+            self.intermediate_size = config.intermediate_size
+
+            self.self_attn = MllamaVisionAttention(config)
+            self.mlp = MllamaVisionMLP(config)
+
+            self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
+            self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
+
+            if is_gated:
+                self.gate_attn = nn.Parameter(torch.ones(1) * math.pi / 4)
+                self.gate_ffn = nn.Parameter(torch.ones(1) * math.pi / 4)
+
+        def forward(
+            self,
+            hidden_state: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+        ):
+            # Self Attention
+            residual = hidden_state
+            hidden_state = self.input_layernorm(hidden_state)
+            hidden_state, attn_weights = self.self_attn(hidden_state, attention_mask=attention_mask)
+            if self.is_gated:
+                hidden_state = self.gate_attn.tanh() * hidden_state
+            hidden_state = residual + hidden_state
+
+            # Feed forward
+            residual = hidden_state
+            hidden_state = self.post_attention_layernorm(hidden_state)
+            hidden_state = self.mlp(hidden_state)
+            if self.is_gated:
+                hidden_state = self.gate_ffn.tanh() * hidden_state
+            hidden_state = residual + hidden_state
+
+            return hidden_state
+
+    try:
+        vision_encoder_forward_source = inspect.getsource(MllamaVisionEncoder.forward)
+        if "gradient_checkpointing" not in vision_encoder_forward_source:
+            transformers.models.mllama.modeling_mllama.MllamaVisionEncoderLayer = MllamaVisionEncoderLayer
+    except Exception as e:
+        return raise_error("transformers.models.mllama.modeling_mllama.MllamaVisionEncoderLayer", e)
+
+pass
+TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
+
+
+# Patch Siglip for forced float32 / float16 only
+def patch_SiglipEncoderLayer():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    try:
+        import transformers.models.siglip.modeling_siglip
+    except Exception as e:
+        return raise_error("transformers.models.siglip.modeling_siglip", e)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_attentions: Optional[bool] = False,
+    ) -> tuple[torch.FloatTensor]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`):
+                Input to the layer of shape `(batch, seq_len, embed_dim)`.
+            attention_mask (`torch.FloatTensor`):
+                Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+        """
+        hidden_states = hidden_states.to(torch.float32)
+        residual = hidden_states
+
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states.to(torch.float16),
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states.to(torch.float16))
+        hidden_states = hidden_states.to(torch.float32)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
+    pass
+    patch_function(transformers.models.siglip.modeling_siglip.SiglipEncoderLayer, "forward", forward)
+pass
+TEMPORARY_PATCHES.append(patch_SiglipEncoderLayer)
